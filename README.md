@@ -1,4 +1,16 @@
-# CLI Proxy API
+# Rizi Bridge
+
+Rizi Bridge is a personal fork of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+(MIT). It tracks upstream closely and carries a small stack of fork-only patches for the
+Rizi KakaoTalk agent and Hermes setup.
+
+- Binary name: `rizi-bridge` (`go build -o rizi-bridge ./cmd/server`)
+- Go module path is unchanged (`github.com/router-for-me/CLIProxyAPI/v8`) to keep upstream syncs conflict-free.
+- Upstream documentation below applies unless a fork patch says otherwise.
+
+---
+
+## Upstream README: CLI Proxy API
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
