@@ -98,7 +98,18 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	websocketProvider := provider
+	if strings.EqualFold(strings.TrimSpace(provider), "mixed") && len(available) > 0 {
+		// Keep mixed-provider ranking intact unless every available candidate is Codex.
+		websocketProvider = "codex"
+		for _, candidate := range available {
+			if executorKeyFromAuth(candidate) != "codex" {
+				websocketProvider = provider
+				break
+			}
+		}
+	}
+	available = preferCodexWebsocketAuths(ctx, websocketProvider, available)
 	known, unknown := soonestResetOrder(available, now)
 	if len(known) > 0 {
 		return known[0], nil

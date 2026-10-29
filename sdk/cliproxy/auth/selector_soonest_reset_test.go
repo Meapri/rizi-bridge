@@ -573,3 +573,129 @@ func TestManagerSoonestResetSelectorRanksLiveQuotaSignals(t *testing.T) {
 	manager.MarkResult(headerCtx, Result{AuthID: "srf-live-a", Provider: "codex", Model: "gpt-5.3-codex", Success: true})
 	assertSelected("after observation", "srf-live-a")
 }
+
+func TestManagerSoonestResetMixedPrefersCodexWebsocket(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	manager := NewManager(nil, &SoonestResetSelector{}, nil)
+	manager.RegisterExecutor(&soonestResetTestExecutor{id: "codex"})
+	if manager.useSchedulerFastPath() {
+		t.Fatal("expected legacy mixed selection path")
+	}
+	now := time.Now()
+	httpSoon := codexResetAuth("http-soon", now.Add(time.Hour), "10")
+	wsLate := codexResetAuth("ws-late", now.Add(24*time.Hour), "10")
+	wsLate.Attributes = map[string]string{"websockets": "true"}
+	for _, auth := range []*Auth{httpSoon, wsLate} {
+		if _, err := manager.Register(WithSkipPersist(ctx), auth); err != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, err)
+		}
+	}
+
+	wsCtx := cliproxyexecutor.WithDownstreamWebsocket(ctx)
+	picked, _, provider, err := manager.pickNextMixed(wsCtx, []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickNextMixed: %v", err)
+	}
+	if picked.ID != "ws-late" || provider != "codex" {
+		t.Fatalf("pickNextMixed websocket = (%q, %q), want (ws-late, codex)", picked.ID, provider)
+	}
+}
+
+func TestManagerSoonestResetMixedWebsocketBehavior(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		websocket  bool
+		other      bool
+		triedOther bool
+		wsEnabled  bool
+		wsPriority string
+		want       string
+	}{
+		{name: "http keeps reset ordering", wsEnabled: true, want: "codex-http"},
+		{name: "no websocket capable auth falls back", websocket: true, want: "codex-http"},
+		{name: "mixed providers preserve reset ordering", websocket: true, other: true, wsEnabled: true, want: "other-soon"},
+		{name: "tried other provider is excluded", websocket: true, other: true, triedOther: true, wsEnabled: true, want: "codex-ws"},
+		{name: "higher priority precedes websocket preference", websocket: true, wsEnabled: true, wsPriority: "-1", want: "codex-http"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			manager := NewManager(nil, &SoonestResetSelector{}, nil)
+			manager.RegisterExecutor(&soonestResetTestExecutor{id: "codex"})
+			manager.RegisterExecutor(&soonestResetTestExecutor{id: "claude"})
+			now := time.Now()
+			httpAuth := codexResetAuth("codex-http", now.Add(time.Hour), "10")
+			wsAuth := codexResetAuth("codex-ws", now.Add(24*time.Hour), "10")
+			wsAuth.Attributes = map[string]string{"websockets": strconv.FormatBool(tt.wsEnabled), "priority": tt.wsPriority}
+			auths := []*Auth{httpAuth, wsAuth}
+			if tt.other {
+				other := &Auth{ID: "other-soon", Provider: "claude", Quota: QuotaState{
+					Signals: map[string]string{"anthropic-ratelimit-unified-5h-reset": soonestResetEpoch(now.Add(30 * time.Minute))},
+				}}
+				auths = append(auths, other)
+			}
+			for _, auth := range auths {
+				if _, err := manager.Register(WithSkipPersist(ctx), auth); err != nil {
+					t.Fatalf("Register(%s): %v", auth.ID, err)
+				}
+			}
+			if tt.websocket {
+				ctx = cliproxyexecutor.WithDownstreamWebsocket(ctx)
+			}
+			tried := map[string]struct{}{}
+			if tt.triedOther {
+				tried["other-soon"] = struct{}{}
+			}
+			picked, _, _, err := manager.pickNextMixed(ctx, []string{"codex", "claude"}, "", cliproxyexecutor.Options{}, tried)
+			if err != nil {
+				t.Fatalf("pickNextMixed: %v", err)
+			}
+			if picked.ID != tt.want {
+				t.Fatalf("pickNextMixed = %q, want %q", picked.ID, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerSoonestResetMixedWebsocketSessionAffinity(t *testing.T) {
+	t.Parallel()
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &SoonestResetSelector{}, TTL: time.Minute})
+	defer selector.Stop()
+	manager := NewManager(nil, selector, nil)
+	if manager.useSchedulerFastPath() {
+		t.Fatal("expected legacy mixed selection path")
+	}
+	manager.RegisterExecutor(&soonestResetTestExecutor{id: "codex"})
+	ctx := context.Background()
+	now := time.Now()
+	httpAuth := codexResetAuth("http-soon", now.Add(time.Hour), "10")
+	wsAuth := codexResetAuth("ws-late", now.Add(24*time.Hour), "10")
+	wsAuth.Attributes = map[string]string{"websockets": "true"}
+	for _, auth := range []*Auth{httpAuth, wsAuth} {
+		if _, err := manager.Register(WithSkipPersist(ctx), auth); err != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, err)
+		}
+	}
+	pick := func(ctx context.Context, session string) string {
+		t.Helper()
+		headers := make(http.Header)
+		headers.Set("Session_id", session)
+		picked, _, _, err := manager.pickNextMixed(ctx, []string{"codex"}, "", cliproxyexecutor.Options{Headers: headers}, nil)
+		if err != nil {
+			t.Fatalf("pickNextMixed: %v", err)
+		}
+		return picked.ID
+	}
+	wsCtx := cliproxyexecutor.WithDownstreamWebsocket(ctx)
+	if got := pick(wsCtx, "new-ws-session"); got != "ws-late" {
+		t.Fatalf("cold websocket session = %q, want ws-late", got)
+	}
+	if got := pick(ctx, "existing-http-session"); got != "http-soon" {
+		t.Fatalf("cold HTTP session = %q, want http-soon", got)
+	}
+	if got := pick(wsCtx, "existing-http-session"); got != "http-soon" {
+		t.Fatalf("bound websocket session = %q, want existing binding http-soon", got)
+	}
+}
